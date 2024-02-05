@@ -1,0 +1,253 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <dirent.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <limits.h>
+#include <gtk/gtk.h>
+
+#define MAX_PATH_LENGTH 256
+#define MAX_THREADS 100
+
+#define ANSI_COLOR_BLUE "\x1b[94m"
+#define ANSI_COLOR_RESET "\x1b[0m"
+
+typedef struct {
+    char path[MAX_PATH_LENGTH];
+    int file_count;
+    int txt_count;
+    int c_count;
+    int doc_count;
+    char smallest_file[MAX_PATH_LENGTH];
+    char largest_file[MAX_PATH_LENGTH];
+    long long smallest_file_size;
+    long long largest_file_size;
+} DirectoryData;
+
+typedef struct {
+    int txt_count;
+    int c_count;
+    int doc_count;
+    char smallest_file[MAX_PATH_LENGTH];
+    char largest_file[MAX_PATH_LENGTH];
+    long long smallest_file_size;
+    long long largest_file_size;
+    pthread_mutex_t mutex;
+} FileTypeCount;
+
+sem_t semaphore;
+FileTypeCount file_count_data;
+
+
+void* process_directory(void* arg) {
+    DirectoryData* data = (DirectoryData*)arg;
+    char path[MAX_PATH_LENGTH];
+    struct dirent* entry;
+    struct stat file_stat;
+
+    DIR* dir = opendir(data->path);
+    if (dir == NULL) {
+        perror("Error opening directory");
+        pthread_exit(NULL);
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        snprintf(path, MAX_PATH_LENGTH, "%s/%s", data->path, entry->d_name);
+
+        if (stat(path, &file_stat) == -1) {
+            perror("Error getting file stat");
+            continue;
+        }
+
+        if (S_ISDIR(file_stat.st_mode)) {
+            //directory?
+            DirectoryData* sub_data = malloc(sizeof(DirectoryData));
+            strcpy(sub_data->path, path);
+
+            
+            sub_data->file_count = 0;
+            sub_data->txt_count = 0;
+            sub_data->c_count = 0;
+            sub_data->doc_count = 0;
+
+            strcpy(sub_data->smallest_file, "");
+            strcpy(sub_data->largest_file, "");
+            sub_data->smallest_file_size = LLONG_MAX;
+            sub_data->largest_file_size = 0;
+
+            sem_wait(&semaphore);
+
+            pthread_t thread;
+            if (pthread_create(&thread, NULL, process_directory, sub_data) != 0) {
+                perror("Error creating thread");
+                free(sub_data);
+                sem_post(&semaphore);
+                continue;
+            }
+
+            pthread_join(thread, NULL);
+           
+            data->file_count += sub_data->file_count;
+            data->txt_count += sub_data->txt_count;
+            data->c_count += sub_data->c_count;
+            data->doc_count += sub_data->doc_count;
+
+            if (sub_data->smallest_file_size <= data->smallest_file_size) {
+                strcpy(data->smallest_file, sub_data->smallest_file);
+                data->smallest_file_size = sub_data->smallest_file_size;
+            }
+
+            if (sub_data->largest_file_size >= data->largest_file_size) {
+                strcpy(data->largest_file, sub_data->largest_file);
+                data->largest_file_size = sub_data->largest_file_size;
+            }
+
+            sem_post(&semaphore);
+
+            free(sub_data);
+        } else if (S_ISREG(file_stat.st_mode)) {
+            data->file_count++;
+
+            char* file_extension = strrchr(entry->d_name, '.');
+            if (file_extension != NULL) {
+                if (strcmp(file_extension, ".txt") == 0) {
+                    pthread_mutex_lock(&file_count_data.mutex);
+                    file_count_data.txt_count++;
+                    pthread_mutex_unlock(&file_count_data.mutex);
+                } else if (strcmp(file_extension, ".c") == 0) {
+                    pthread_mutex_lock(&file_count_data.mutex);
+                    file_count_data.c_count++;
+                    pthread_mutex_unlock(&file_count_data.mutex);
+                } else if (strcmp(file_extension, ".doc") == 0) {
+                    pthread_mutex_lock(&file_count_data.mutex);
+                    file_count_data.doc_count++;
+                    pthread_mutex_unlock(&file_count_data.mutex);
+                }
+                long long file_size = file_stat.st_size;
+
+            if (file_size < data->smallest_file_size) {
+                strcpy(data->smallest_file, path);
+                data->smallest_file_size = file_size;
+            }
+
+            if (file_size > data->largest_file_size) {
+                strcpy(data->largest_file, path);
+                data->largest_file_size = file_size;
+            }
+            }
+             
+        }
+        
+    }
+    
+    closedir(dir);
+    pthread_exit(NULL);
+}
+
+long long get_folder_size(const char *folder_path) {
+    struct dirent *entry;
+    struct stat info;
+    DIR *dir;
+    long long total_size = 0;
+
+    dir = opendir(folder_path);
+    if (dir == NULL) {
+        printf("Error: Failed to open the directory.\n");
+        return -1;
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        char file_path[1000];
+        strcpy(file_path, folder_path);
+        strcat(file_path, "/");
+        strcat(file_path, entry->d_name);
+        
+        if (stat(file_path, &info) == 0) {
+            if (S_ISDIR(info.st_mode)) {
+                if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
+                    total_size += get_folder_size(file_path);
+                }
+            } else if (S_ISREG(info.st_mode)) {
+                total_size += info.st_size;
+            }
+        }
+    }
+
+    closedir(dir);
+    return total_size;
+}
+
+int main() {
+    char root_path[MAX_PATH_LENGTH];
+    printf("Enter directory path: ");
+    scanf("%s", root_path);
+
+    DirectoryData root_data;
+    strcpy(root_data.path, root_path);
+    root_data.file_count = 0;
+    root_data.txt_count = 0;
+    root_data.c_count = 0;
+    root_data.doc_count = 0;
+
+    strcpy(root_data.smallest_file, "");
+    strcpy(root_data.largest_file, "");
+    root_data.smallest_file_size = LLONG_MAX;
+    root_data.largest_file_size = 0;
+
+    sem_init(&semaphore, 0, MAX_THREADS);
+    pthread_mutex_init(&file_count_data.mutex, NULL);
+
+    pthread_t root_thread;
+    if (pthread_create(&root_thread, NULL, process_directory, &root_data) != 0) {
+        perror("Error creating thread");
+        return 0;
+    }
+
+    pthread_join(root_thread, NULL);
+
+    printf("Total files in directory '%s':\n", root_path);
+    printf("Total files: %d\n", root_data.file_count);
+    printf("Total txt files: %d\n", root_data.txt_count + file_count_data.txt_count);
+    printf("Total c files: %d\n", root_data.c_count + file_count_data.c_count);
+    printf("Total doc files: %d\n", root_data.doc_count + file_count_data.doc_count);        
+
+    if (strcmp(root_data.smallest_file, "") != 0) {
+        printf(ANSI_COLOR_BLUE "Smallest file address: %s\n", root_data.smallest_file);
+        printf(ANSI_COLOR_RESET "Smallest file size: %lld bytes\n", root_data.smallest_file_size);
+    }
+
+    if (strcmp(root_data.largest_file, "") != 0) {
+        printf(ANSI_COLOR_BLUE"Largest file address:  %s\n", root_data.largest_file);
+        printf(ANSI_COLOR_RESET "Largest file size: %lld bytes\n", root_data.largest_file_size);
+    }
+
+    long long size = get_folder_size(root_path);
+    if (size >= 0) {
+        printf("Folder size: %lld bytes\n", size);
+    }
+}   
+
+
+void on_window_closed(GtkWidget *widget, gpointer data) {
+    gtk_main_quit();
+}
+
+int main(int argc, char *argv[]) {
+    gtk_init(&argc, &argv);
+
+    GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(window), "برنامه گرافیکی");
+    gtk_window_set_default_size(GTK_WINDOW(window), 200, 100);
+    g_signal_connect(window, "destroy", G_CALLBACK(on_window_closed), NULL);
+    GtkWidget *label = gtk_label_new("Hello, World!");
+    gtk_container_add(GTK_CONTAINER(window), label);
+    gtk_widget_show_all(window);
+    gtk_main();
+
+    return 0;
+}
